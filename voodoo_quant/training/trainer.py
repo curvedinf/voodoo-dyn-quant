@@ -1510,6 +1510,13 @@ def build_parser():
                         help="JSON list of upgrade definitions applied post-training, pre-finalization. "
                              "Each definition: {pattern: regex, levels: N}. Matched tensors get "
                              "their quant type moved N steps up (N>0) or down (N<0) the quant ladder.")
+    parser.add_argument("--st_gumbel_fraction", type=float, default=0.0,
+                        help="Straight-through Gumbel hardening: per-step probability each layer "
+                             "forwards a one-hot sampled candidate instead of the soft mixture "
+                             "(backward stays soft/exact). 0 disables. Typical 0.5.")
+    parser.add_argument("--st_gumbel_tau", type=float, default=1.0,
+                        help="Gumbel sampling temperature for --st_gumbel_fraction (lower = more "
+                             "argmax-like sampling). Ignored when fraction is 0.")
     parser.add_argument("--budget_reduction", type=float, default=0.0,
                         help="Reduce target size budget by this fraction (0.05 = 5% smaller target). "
                              "Gives headroom for tensor upgrades without exceeding target size.")
@@ -1589,6 +1596,17 @@ def run(args):
         raise ValueError("Either --compression_ratio or --target_bits must be specified.")
     if args.compression_ratio is not None and args.target_bits is not None:
         raise ValueError("Specify only one of --compression_ratio or --target_bits.")
+
+    # Straight-through Gumbel hardening (see MixedQuantLinear.get_probs).
+    if getattr(args, "st_gumbel_fraction", 0.0) > 0.0:
+        from voodoo_quant import layers as _layers
+
+        _layers.set_st_gumbel(True, args.st_gumbel_fraction, getattr(args, "st_gumbel_tau", 1.0))
+        print(
+            f"  [st-gumbel] enabled: fraction={args.st_gumbel_fraction} "
+            f"tau={getattr(args, 'st_gumbel_tau', 1.0)}",
+            flush=True,
+        )
 
     # Full tensor parallelism (--tensor_parallel under torchrun).  Initialized
     # first so every later `cuda` device reference resolves to this rank's

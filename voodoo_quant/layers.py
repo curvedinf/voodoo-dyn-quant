@@ -683,6 +683,23 @@ CANDIDATE_CACHE_DIR = Path(voodoo_quant.__file__).parent.parent / ".cache" / "mi
 _CANDIDATE_CACHE_ROOT = CANDIDATE_CACHE_DIR
 
 
+class _STGumbelState:
+    """Global straight-through Gumbel hardening settings (see get_probs)."""
+
+    enabled: bool = False
+    fraction: float = 0.0  # per-step probability a given layer hardens
+    gs_tau: float = 1.0  # Gumbel-softmax sampling temperature
+
+
+_ST_GUMBEL_STATE = _STGumbelState()
+
+
+def set_st_gumbel(enabled: bool, fraction: float, gs_tau: float) -> None:
+    _ST_GUMBEL_STATE.enabled = enabled
+    _ST_GUMBEL_STATE.fraction = float(fraction)
+    _ST_GUMBEL_STATE.gs_tau = float(gs_tau)
+
+
 def _tensor_hash(t: torch.Tensor | None) -> str:
     """Stable SHA-256 hash of a contiguous CPU tensor's raw bytes.
 
@@ -1139,7 +1156,28 @@ class _MixedQuantBase(nn.Module):
         self.temperature = max(temperature, 1e-6)
 
     def get_probs(self) -> torch.Tensor:
-        return F.softmax(self.gates / self.temperature, dim=0)
+        probs = F.softmax(self.gates / self.temperature, dim=0)
+        # Straight-through Gumbel top-k hardening (ST hard-sampling): when a
+        # global hardening fraction is set, a per-tensor Bernoulli draw picks
+        # which layers harden this step.  Hardened layers forward a one-hot
+        # Gumbel sample (deployed-model behavior) while backward flows through
+        # the soft softmax (custom-mix backward stays exact for the gates).
+        # Sampling (not argmax) keeps exploration alive: a wrong early argmax
+        # can still be corrected via its soft gradient on later steps.
+        if _ST_GUMBEL_STATE.enabled:
+            import random as _random
+
+            if _random.random() < _ST_GUMBEL_STATE.fraction:
+                u = torch.rand_like(probs)
+                gumbel = -torch.log(-torch.log(u.clamp_min(1e-9)).clamp_min(1e-9))
+                scores = (torch.log(probs.clamp_min(1e-9)) + gumbel) / max(
+                    _ST_GUMBEL_STATE.gs_tau, 1e-3
+                )
+                hard = F.one_hot(scores.argmax(dim=0), num_classes=probs.shape[0]).to(probs.dtype)
+                # Forward uses the one-hot sample; gradient flows to `probs`
+                # (straight-through): d(hard)/d(gates) := d(probs)/d(gates).
+                return (hard - probs).detach() + probs
+        return probs
 
     def _get_candidate(self, k: int) -> torch.Tensor:
         qt = self.candidate_types[k]

@@ -85,6 +85,38 @@ class TestMixedQuantGates:
         # gates still ~uniform -> assignment is argmax; prob mass at low tau is ~1
         assert lin.get_assignment() in ("IQ2_XXS", "Q4_K")
 
+    def test_st_gumbel_hardening(self):
+        import torch.nn.functional as F
+
+        from voodoo_quant import layers
+
+        lin = layers.MixedQuantLinear(
+            512, 64, ["IQ2_XXS", "Q4_K", "Q8_0"], torch.randn(64, 512) * 0.01 + 0.5,
+            lazy=False, tensor_name="t3.proj",
+        )
+        try:
+            # disabled: plain softmax
+            layers.set_st_gumbel(False, 0.0, 1.0)
+            soft = F.softmax(lin.gates / lin.temperature, dim=0)
+            assert torch.allclose(lin.get_probs(), soft)
+
+            # fraction=1: forward is always a one-hot sample
+            layers.set_st_gumbel(True, 1.0, 0.5)
+            for _ in range(10):
+                p = lin.get_probs()
+                assert p.sum() == 1 and ((p == 0) | (p == 1)).all()
+
+            # straight-through: forward is hard, gradient is the soft one
+            c = torch.tensor([0.1, 0.9, -0.4])
+            (lin.get_probs() * c).sum().backward()
+            hard_grad = lin.gates.grad.clone()
+            lin.gates.grad = None
+            layers.set_st_gumbel(False, 0.0, 1.0)
+            (lin.get_probs() * c).sum().backward()
+            assert torch.allclose(hard_grad, lin.gates.grad, atol=1e-6)
+        finally:
+            layers.set_st_gumbel(False, 0.0, 1.0)
+
     def test_role_menus(self):
         from voodoo_quant.layers import resolve_candidate_types
 

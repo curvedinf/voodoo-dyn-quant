@@ -80,6 +80,10 @@ tests/               unit + smoke tests (CPU-runnable where possible)
 - Default candidate set excludes ternary (`TQ1_0`/`TQ2_0` underperform).
 - Post-hoc `--tensor_upgrades` accept negative levels (rungs down); first
   match wins; `--budget_reduction` funds upgrades without busting the target.
+- Straight-through Gumbel hardening (`--st_gumbel_fraction`, 0 = off): each
+  layer forwards a one-hot Gumbel sample of its gates with that per-step
+  probability; backward stays soft/exact. `--st_gumbel_tau` sets sampling
+  sharpness.
 - Training runs journal `partial.pt` + `partial.meta.json` in the output dir;
   crash recovery is `--finalize_from_partial`, continue-training is
   `--resume_from_partial`. TP launchers auto-resume from the journal.

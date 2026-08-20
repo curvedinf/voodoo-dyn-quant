@@ -81,6 +81,10 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
 - **Knapsack polish** (`--polish`): after argmax, budget-aware one-rung swaps
   ranked by the measured table. Requires `--warm_start`'s table (persists to
   `sensitivity.pkl`); skips itself otherwise.
+- **ST-Gumbel hardening** (`--st_gumbel_fraction`, e.g. 0.5): each layer
+  forwards a one-hot Gumbel sample of its gates with that per-step probability
+  (deployed-model behavior) while gradients stay soft/exact. Off by default;
+  `--st_gumbel_tau` tunes sample sharpness.
 - **Long context**: train at the seq_len you serve (8192); the quality gap of
   a bad allocation widens with context (5.3% → 9.2% from 512 → 8k).
 - **Keep your own imatrix** (`--imatrix`); calibration volume is worth only

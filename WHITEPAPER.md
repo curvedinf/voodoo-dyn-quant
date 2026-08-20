@@ -44,6 +44,15 @@ W_eff = Σ_k  p_k · W_k        where  p = softmax(gates / τ)
 Early on, all candidates blend (smooth gradient signal to every gate); as `τ`
 falls, the softmax concentrates and the mixture approaches a hard argmax.
 
+Optionally, **straight-through Gumbel hardening** (`--st_gumbel_fraction`,
+default 0 = off) has each layer forward, with that per-step probability, a
+one-hot Gumbel-softmax sample of its gates instead of the soft mixture — the
+exact forward behavior of the deployed argmax model — while backward still
+flows through the soft softmax (straight-through estimator, so gate gradients
+stay exact). Sampling rather than argmax keeps exploration alive: an early
+wrong choice still receives gradient and can be corrected on later steps.
+`--st_gumbel_tau` controls the sample sharpness (lower = more argmax-like).
+
 ### 2.2 The loss
 
 The only trainable parameters are the gates (~one scalar per tensor per

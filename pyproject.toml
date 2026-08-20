@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voodoo-dyn-quant"
+version = "0.1.0"
+description = "Voodoo: learned per-tensor mixed-precision quantization for any LLM architecture, llama.cpp-exact by construction."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "voodooquant" }]
+keywords = ["quantization", "llm", "gguf", "llama-cpp", "distillation", "mixed-precision"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "transformers>=4.51",
+    "gguf>=0.10",
+    "datasets>=2.19",
+]
+
+[project.optional-dependencies]
+# Torch is an extra so ROCm users can preinstall the ROCm wheel before `pip install -e .`.
+# CPU/CUDA users: pip install -e ".[torch]" picks the right wheel for their platform.
+torch = ["torch>=2.3"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+voodoo = "voodoo_quant.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["voodoo_quant*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

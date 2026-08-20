@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# voodoo-dyn-quant
+.venv/
+third_party/
+.cache/
+.checkpoints*
+checkpoints/
+data/
+logs/
+*.gguf
+*.pt
+!tests/data/*.pt

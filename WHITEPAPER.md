@@ -210,7 +210,27 @@ Released GGUFs carry a UD-equivalent badge
 (`<slug>.Voodoo45_IQ2_M.gguf`) so model cards index correctly; the label is a
 fixed curated mapping, not derived from the assignment.
 
-## 8. Reproducing the pipeline
+## 8. The MTP sidecar
+
+Models with multi-token-prediction modules carry a `blk.N.nextn.*` sidecar
+in their reference GGUF that the trained checkpoint does not cover. It is
+inert for perplexity (llama.cpp logs it as unused) and only matters under
+speculative decoding — but copying it through unquantized left ~810 MiB of
+BF16 in a 27B export where the reference's own layout carries ~335 MiB. The
+exporter now quantizes the sidecar by spec (`voodoo_quant/tools/sidecar.py`,
+overridable via `--sidecar-quant`, default `Q6_K`):
+
+| sidecar tensor family | storage |
+|---|---|
+| large `.weight` matrices (eh_proj, own attn/mlp projections) | requested level (default `Q6_K`) |
+| sidecar attention k/v | `Q8_0` (measured reference layout) |
+| norms, per-head SSM state, conv kernels, biases, <2-row tensors | `F32` |
+
+All of it through the exact ggml quantizer, like every other byte in an
+export. Measured on Qwen3.5-0.8B-MTP: 362.6 MB vs 385.3 MB unquantized
+(−5.9%) with PPL unchanged under llama.cpp.
+
+## 9. Reproducing the pipeline
 
 ```
 1. voodoo data      # tokenize calibration text (or point at existing tokens)
@@ -222,7 +242,7 @@ fixed curated mapping, not derived from the assignment.
 Every stage is resumable and journaled; the candidate cache makes re-runs at
 different sizes start in seconds.
 
-## 9. Sensitivity warm-start and knapsack polish
+## 10. Sensitivity warm-start and knapsack polish
 
 The gate loop structurally mis-attributes credit: logit-KL gives attention
 tensors strong local gradients (they sit near the input of every downstream

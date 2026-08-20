@@ -19,6 +19,12 @@ Bake a trained assignment into a llama.cpp-exact GGUF.
 - The output is auto-renamed to the canonical
   `<slug>.Voodoo{NN}_{QUANT}.gguf` (curated label from
   `voodoo_quant.naming.VOODOO_QUANT_LABEL`); pass `--quant-label` to override.
+- **MTP sidecar**: tensors present only in the reference (`blk.N.nextn.*`)
+  are quantized per `voodoo_quant.tools.sidecar` — large weights `Q6_K`
+  (override with `--sidecar-quant <TYPE>`), attention k/v `Q8_0`, norms and
+  per-head state F32 — by the same exact ggml quantizer. `--sidecar-quant
+  none` copies through unquantized (F32/BF16), which costs ~25% file size at
+  27B (~475 MiB); defaulting to Q6_K matches the measured reference layout.
 - Tied embeddings (`tie_word_embeddings=True`): `output.weight` is omitted and
   llama.cpp reuses `token_embd.weight` — correct, leave it.
 - Split reference GGUFs: the reference must be a single-file GGUF; a split

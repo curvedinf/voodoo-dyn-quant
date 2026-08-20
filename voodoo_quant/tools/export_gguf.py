@@ -411,6 +411,15 @@ def build_parser():
     parser.add_argument("--ref-gguf", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
+        "--sidecar-quant",
+        default=None,
+        help="Quantization level for the MTP (nextn) sidecar tensors copied from the "
+             "reference GGUF. A llama.cpp quant type (default Q6_K; attention k/v get "
+             "Q8_0, norms/per-head state stay F32 — the measured reference layout). "
+             "'none' copies sidecar tensors through unquantized (F32/BF16), which for "
+             "27B-class models costs ~475 MiB of dead weight.",
+    )
+    parser.add_argument(
         "--quant-label",
         default=None,
         help="Override the UD-equivalent quant label used in the canonical "
@@ -566,22 +575,57 @@ def run(args):
 
     # Copy any tensors present in the reference GGUF but not in the checkpoint
     # state dict. For MTP variants this preserves the nextn_predict sidecar
-    # (e.g. blk.N.nextn.* tensors) so the exported GGUF remains a valid MTP model.
+    # (e.g. blk.N.nextn.* tensors) so the exported GGUF remains a valid MTP
+    # model. Sidecar weights are QUANTIZED per the sidecar spec (default
+    # Q6_K, attention k/v Q8_0, norms/per-head state F32) by the same exact
+    # ggml quantizer as everything else; --sidecar-quant none keeps the old
+    # unquantized copy-through.
+    from voodoo_quant.tools.sidecar import (
+        DEFAULT_SIDECAR_QUANT,
+        describe as describe_sidecar,
+        sidecar_quant_for_tensor,
+    )
+
+    sidecar_level = args.sidecar_quant
+    if sidecar_level is None or sidecar_level.lower() == "default":
+        sidecar_level = DEFAULT_SIDECAR_QUANT
+    sidecar_enabled = sidecar_level.lower() not in ("none", "off", "bf16", "f32")
+
     nextn_copied = 0
+    nextn_quantized = 0
+    if sidecar_enabled:
+        print(f"  {describe_sidecar(sidecar_level)}", flush=True)
+    else:
+        print("  MTP sidecar: copying through unquantized (--sidecar-quant none)", flush=True)
+
     for ref_tensor in reader.tensors:
         if ref_tensor.name in written_gguf_names:
             continue
         arr = gguf_dequantize(ref_tensor.data, ref_tensor.tensor_type).astype(np.float32)
-        if ref_tensor.tensor_type == GGMLQuantizationType.F32:
+        sidecar_qt = None
+        if sidecar_enabled:
+            sidecar_qt = sidecar_quant_for_tensor(
+                ref_tensor.name, tuple(int(d) for d in ref_tensor.shape),
+                level=sidecar_level,
+            )
+        if sidecar_qt is not None:
+            add_quantized_tensor(writer, ref_tensor.name, torch.from_numpy(arr), sidecar_qt)
+            nextn_quantized += 1
+        elif ref_tensor.tensor_type == GGMLQuantizationType.F32:
             data, shape = arr, arr.shape
             ggml_type = GGMLQuantizationType.F32
+            writer.add_tensor(ref_tensor.name, data, raw_shape=shape, raw_dtype=ggml_type)
         else:
             ggml_type = GGMLQuantizationType.BF16
             data, shape = tensor_to_gguf(torch.from_numpy(arr), ggml_type)
-        writer.add_tensor(ref_tensor.name, data, raw_shape=shape, raw_dtype=ggml_type)
+            writer.add_tensor(ref_tensor.name, data, raw_shape=shape, raw_dtype=ggml_type)
         nextn_copied += 1
 
-    print(f"Wrote {quantized} quantized tensors, {written} default tensors; skipped {skipped}; copied {nextn_copied} reference-only tensors (MTP sidecar)")
+    print(
+        f"Wrote {quantized} quantized tensors, {written} default tensors; skipped {skipped}; "
+        f"sidecar: {nextn_quantized} quantized + {nextn_copied - nextn_quantized} kept, "
+        f"of {nextn_copied} copied"
+    )
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()

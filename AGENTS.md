@@ -60,7 +60,8 @@ voodoo_quant/
   quants/            GPU dequant kernels + LUTs for IQ/K formats
   hardware/          vendor detection, env defaults, ROCm flash-attention backend
   training/          trainer.py (gate training + bake), q8_teacher.py
-  tools/             data.py, precache.py, export_gguf.py, evaluate.py, make_teacher.py
+  tools/             data.py, precache.py, export_gguf.py, evaluate.py, make_teacher.py,
+                     sidecar.py (MTP nextn sidecar quant spec: default Q6_K, k/v Q8_0)
   naming.py          Voodoo{NN} size/label conventions
   imatrix.py         llama.cpp imatrix GGUF → HF tensor-name mapping
   cli.py             `voodoo` entrypoint (train/tp/export/eval/data/precache/make-teacher/doctor)

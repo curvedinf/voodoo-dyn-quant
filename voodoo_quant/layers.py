@@ -363,6 +363,71 @@ class _MixedWeightFunction(Function):
         return (None, grad_probs) + (None,) * len(candidates)
 
 
+class _RoutedMixedLinear(Function):
+    """PTQR forward: y[t] = x[t] @ W_{k*(t)}^T, ONE candidate per token.
+
+    Rows are grouped by the per-token Gumbel sample (see _sample_token_routing)
+    and each group runs only its candidate's matmul, so no candidate averaging
+    — and therefore no within-token mixture (Jensen) gain — occurs anywhere in
+    the model.  Total matmul FLOPs equal a normal forward; candidates stream
+    to the compute device one at a time like _MixedWeightFunction.
+
+    Backward is the straight-through mixture Jacobian evaluated at the routed
+    point (the ST identity y_routed + y_mix - sg(y_mix), with y_mix never
+    materialized):
+        grad_p_k = <grad_out, x @ W_k^T> = ((grad_out^T x) * W_k).sum()
+        grad_x   = grad_out @ (sum_k p_k W_k)
+    """
+
+    @staticmethod
+    def forward(ctx, source_dtype, probs, routing, x, *candidates):
+        orig_shape = x.shape
+        x2 = x.reshape(-1, orig_shape[-1])
+        device = x2.device
+        routing = routing.to(device)
+        xf = x2.to(torch.float32)
+        out = torch.zeros(x2.shape[0], candidates[0].shape[0], dtype=torch.float32, device=device)
+        for k, cand in enumerate(candidates):
+            rows = torch.nonzero(routing == k, as_tuple=False).squeeze(1)
+            if rows.numel() == 0:
+                continue
+            w = cand.to(device=device, dtype=torch.float32)
+            out[rows] = xf[rows] @ w.t()
+            del w
+        ctx.source_dtype = source_dtype
+        ctx.probs = probs.detach()
+        ctx.probs_device = probs.device
+        ctx.x2 = x2
+        ctx.x_dtype = x2.dtype
+        ctx.candidates = candidates
+        ctx.x_shape = orig_shape
+        ctx.device = device
+        y = out.to(source_dtype)
+        return y if len(orig_shape) == 2 else y.reshape(*orig_shape[:-1], y.shape[-1])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        G = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.float32)
+        xf = ctx.x2.to(torch.float32)
+        device = ctx.device
+        probs = ctx.probs.to(device)
+        Gx = G.t() @ xf  # [out, in], shared by every grad_p_k below
+        grad_probs = torch.zeros(len(ctx.candidates), device=device, dtype=torch.float32)
+        w_mix = torch.zeros(
+            ctx.candidates[0].shape[0], ctx.candidates[0].shape[1],
+            dtype=torch.float32, device=device,
+        )
+        for k, cand in enumerate(ctx.candidates):
+            w = cand.to(device=device, dtype=torch.float32)
+            w_mix = w_mix + probs[k] * w
+            grad_probs[k] = (Gx * w).sum()
+            del w
+        grad_x = (G @ w_mix).to(ctx.x_dtype)
+        if len(ctx.x_shape) != 2:
+            grad_x = grad_x.reshape(ctx.x_shape)
+        return (None, grad_probs.to(ctx.probs_device), None, grad_x) + (None,) * len(ctx.candidates)
+
+
 # --- Parallel-dequant helpers for the lazy recompute path --------------------
 # Dequantize (CPU ggml) is the dominant cost of lazy training: a 4B layer with
 # K=12 candidates re-dequantizes ~178 GB of fp32 per forward.  The candidates are
@@ -626,11 +691,14 @@ class _MixedEmbeddingRowFunctionLazy(Function):
         padded_in_features,
         embedding_dim,
         probs,
+        routing,
         row_ids,
         *qbytes,
     ):
         device = probs.device
         n_rows = row_ids.shape[0]
+        if routing is not None and routing.device != device:
+            routing = routing.to(device)
         mixed = torch.zeros(n_rows, embedding_dim, dtype=torch.bfloat16, device=device)
         for k in range(len(qbytes)):
             qt = candidate_types[k]
@@ -641,7 +709,13 @@ class _MixedEmbeddingRowFunctionLazy(Function):
             row_qb = qb.view(num_embeddings, nbpr, info.block_bytes)[row_ids].reshape(n_rows * nbpr, info.block_bytes)
             with torch.no_grad():
                 cand_rows = dequantize_tensor_gpu(row_qb, qt, n_rows, padded_in_features, device)
-            mixed = mixed + probs[k] * cand_rows[:, :embedding_dim]
+            if routing is not None:
+                # PTQR: each row keeps exactly one candidate's value; backward
+                # still computes the full mixture gradient below.
+                sel = routing == k
+                mixed[sel] = cand_rows[sel, :embedding_dim]
+            else:
+                mixed = mixed + probs[k] * cand_rows[:, :embedding_dim]
             del cand_rows
         ctx.source_dtype = source_dtype
         ctx.candidate_types = candidate_types
@@ -671,8 +745,51 @@ class _MixedEmbeddingRowFunctionLazy(Function):
             grad_probs[k] = (grad_output * cand_rows[:, : ctx.embedding_dim]).sum()
             del cand_rows
         # source_dtype, candidate_types, num_embeddings, padded_in_features,
-        # embedding_dim, probs, row_ids, *qbytes -> only probs gets a gradient.
-        return (None, None, None, None, None, grad_probs, None) + (None,) * len(ctx.qbytes)
+        # embedding_dim, probs, routing, row_ids, *qbytes -> only probs gets a
+        # gradient.
+        return (None, None, None, None, None, grad_probs, None, None) + (None,) * len(ctx.qbytes)
+
+
+class _RoutedEmbeddingRowFunction(Function):
+    """PTQR embedding lookup (non-lazy): each position uses ONE candidate's row.
+
+    Candidates are CPU tensors [num_embeddings, embedding_dim]; only the rows
+    at the input ids are gathered per candidate, so the full mixed vocabulary
+    weight is never materialized — cheaper than the mixture path, which
+    streams every candidate matrix every step.
+
+    Backward is the straight-through mixture gradient:
+        grad_p_k = <grad_out, W_k[ids]>
+    """
+
+    @staticmethod
+    def forward(ctx, source_dtype, probs, routing, flat_ids, *candidates):
+        device = routing.device
+        out = torch.zeros(flat_ids.shape[0], candidates[0].shape[1], dtype=torch.float32, device=device)
+        for k, cand in enumerate(candidates):
+            rows = torch.nonzero(routing == k, as_tuple=False).squeeze(1)
+            if rows.numel() == 0:
+                continue
+            sel_ids = flat_ids[rows].to(cand.device)
+            out[rows] = cand[sel_ids].to(device=device, dtype=torch.float32)
+        ctx.probs_device = probs.device
+        ctx.flat_ids = flat_ids
+        ctx.candidates = candidates
+        ctx.device = device
+        return out.to(source_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        G = grad_output.to(torch.float32)
+        ids_cpu = ctx.flat_ids.to("cpu")
+        device = ctx.device
+        grad_probs = torch.zeros(len(ctx.candidates), device=device, dtype=torch.float32)
+        for k, cand in enumerate(ctx.candidates):
+            rows_k = cand[ids_cpu].to(device=device, dtype=torch.float32)
+            grad_probs[k] = (G * rows_k).sum()
+            del rows_k
+        # source_dtype, probs, routing, flat_ids, *candidates -> only probs.
+        return (None, grad_probs.to(ctx.probs_device), None, None) + (None,) * len(ctx.candidates)
 
 
 # Candidate quantization is the dominant startup cost for dynamic-quant training.
@@ -689,6 +806,13 @@ class _STGumbelState:
     enabled: bool = False
     fraction: float = 0.0  # per-step probability a given layer hardens
     gs_tau: float = 1.0  # Gumbel-softmax sampling temperature
+    # Optional linear annealing of `fraction` across training: when set, the
+    # effective fraction at optimizer step s (0-indexed) is
+    # f_start + (f_end - f_start) * s / max(steps-1, 1).
+    f_start: float | None = None
+    f_end: float | None = None
+    total_steps: int = 1
+    step: int = 0
 
 
 _ST_GUMBEL_STATE = _STGumbelState()
@@ -698,6 +822,63 @@ def set_st_gumbel(enabled: bool, fraction: float, gs_tau: float) -> None:
     _ST_GUMBEL_STATE.enabled = enabled
     _ST_GUMBEL_STATE.fraction = float(fraction)
     _ST_GUMBEL_STATE.gs_tau = float(gs_tau)
+
+
+def set_st_gumbel_anneal(f_start: float, f_end: float, total_steps: int) -> None:
+    """Enable fraction annealing from f_start to f_end over total_steps."""
+    _ST_GUMBEL_STATE.f_start = float(f_start)
+    _ST_GUMBEL_STATE.f_end = float(f_end)
+    _ST_GUMBEL_STATE.total_steps = max(int(total_steps), 1)
+
+
+def st_gumbel_step(step: int) -> None:
+    """Notify the hardening schedule of the current optimizer step."""
+    _ST_GUMBEL_STATE.step = int(step)
+
+
+def _effective_fraction() -> float:
+    st = _ST_GUMBEL_STATE
+    if st.f_start is None:
+        return st.fraction
+    t = st.step / max(st.total_steps - 1, 1)
+    t = min(max(t, 0.0), 1.0)
+    return st.f_start + (st.f_end - st.f_start) * t
+
+
+class _PTQRState:
+    """Per-Token Quant Routing settings (see _sample_token_routing).
+
+    When enabled, replaced layers run every token through ONE candidate
+    (Gumbel-sampled from the gate probs) instead of averaging candidates —
+    deployed-model behavior with no within-token mixture gain, and no
+    hard/soft chimera (all layers route every step, so training KL measures
+    quality rather than a hardening schedule).
+    """
+
+    enabled: bool = False
+
+
+_PTQR_STATE = _PTQRState()
+
+
+def set_ptqr(enabled: bool) -> None:
+    _PTQR_STATE.enabled = bool(enabled)
+
+
+def _sample_token_routing(probs: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """k*(t) ~ Categorical(probs) per token via the Gumbel-argmax trick.
+
+    Token shares match `probs` in expectation by construction (unlike a
+    nearest-candidate rule, whose shares follow mixture-hull geometry).  No
+    temperature knob: argmax is invariant to any tau > 0, so this samples
+    exactly from the softmax distribution the gates define.  As the gate
+    temperature anneals and probs saturate, routing concentrates on the
+    argmax candidate and the forward converges to the deployed model.
+    """
+    u = torch.rand(probs.shape[0], num_tokens, device=probs.device)
+    gumbel = -torch.log((-torch.log(u.clamp_min(1e-9))).clamp_min(1e-9))
+    scores = torch.log(probs.clamp_min(1e-9)).unsqueeze(1) + gumbel
+    return scores.argmax(dim=0)
 
 
 def _tensor_hash(t: torch.Tensor | None) -> str:
@@ -913,6 +1094,12 @@ class _MixedQuantBase(nn.Module):
             _fcntl.flock(_big_lock, _fcntl.LOCK_EX)
         if imatrix is not None:
             imatrix = imatrix.detach().to(torch.float32).cpu()
+            # Hash the PADDED imatrix (matches the cache generators, which
+            # hash _pad_weight_and_imatrix(weight, im)'s output; a no-op
+            # fp32 cast for the 256-aligned in_features of Qwen3.8).
+            _, padded_imatrix, _ = _pad_weight_and_imatrix(
+                torch.empty(1, quant_weight_full.shape[1], dtype=torch.float32), imatrix
+            )
         # Hash the source bytes directly (chunked; == fp32-hash of the padded
         # tensor because padding is zero-extension and in_features are
         # 256-aligned for every Qwen3.8 tensor).  Only if candidates are
@@ -1155,8 +1342,16 @@ class _MixedQuantBase(nn.Module):
     def set_temperature(self, temperature: float):
         self.temperature = max(temperature, 1e-6)
 
+    def soft_probs(self) -> torch.Tensor:
+        """Softmax gate probs WITHOUT straight-through hardening.
+
+        Used for budgeting (effective_bytes) and argmax reporting, where the
+        *expected* size/assignment is wanted regardless of this step's
+        hardening draw.  The forward path uses get_probs() (ST-Gumbel)."""
+        return F.softmax(self.gates / self.temperature, dim=0)
+
     def get_probs(self) -> torch.Tensor:
-        probs = F.softmax(self.gates / self.temperature, dim=0)
+        probs = self.soft_probs()
         # Straight-through Gumbel top-k hardening (ST hard-sampling): when a
         # global hardening fraction is set, a per-tensor Bernoulli draw picks
         # which layers harden this step.  Hardened layers forward a one-hot
@@ -1167,9 +1362,9 @@ class _MixedQuantBase(nn.Module):
         if _ST_GUMBEL_STATE.enabled:
             import random as _random
 
-            if _random.random() < _ST_GUMBEL_STATE.fraction:
+            if _random.random() < _effective_fraction():
                 u = torch.rand_like(probs)
-                gumbel = -torch.log(-torch.log(u.clamp_min(1e-9)).clamp_min(1e-9))
+                gumbel = -torch.log((-torch.log(u.clamp_min(1e-9))).clamp_min(1e-9))
                 scores = (torch.log(probs.clamp_min(1e-9)) + gumbel) / max(
                     _ST_GUMBEL_STATE.gs_tau, 1e-3
                 )
@@ -1340,7 +1535,10 @@ class _MixedQuantBase(nn.Module):
         return _MixedWeightFunction.apply(self.source_dtype, probs, *candidates)
 
     def effective_bytes(self) -> torch.Tensor:
-        probs = self.get_probs()
+        # Expected size under the SOFT distribution: the size loss must not
+        # see the per-step Gumbel hardening draw (sampled sizes are wildly
+        # noisy and broke budget control in the first ST-Gumbel run).
+        probs = self.soft_probs()
         # Row/col-sharded (TP) layers count their FULL tensor: the gates are
         # replicated across ranks, so every rank must budget the whole tensor.
         out_eff = getattr(self, "_full_out_features", None) or self.out_features
@@ -1355,7 +1553,7 @@ class _MixedQuantBase(nn.Module):
         return self.candidate_types[self.gates.argmax().item()]
 
     def get_assignment_prob(self) -> float:
-        probs = self.get_probs().detach()
+        probs = self.soft_probs().detach()
         return probs[self.gates.argmax().item()].item()
 
 
@@ -1370,7 +1568,7 @@ class _BlockedCandidateLinear(Function):
     """
 
     @staticmethod
-    def forward(ctx, x, qb, qt, out_features, padded_in_features, in_features, prob):
+    def forward(ctx, x, qb, qt, out_features, padded_in_features, in_features, prob, row_sel=None):
         from torch.nn import functional as F
         orig_shape = x.shape
         if x.dim() != 2:
@@ -1394,7 +1592,13 @@ class _BlockedCandidateLinear(Function):
         ctx.out_features = out_features
         ctx.padded_in_features = padded_in_features
         ctx.in_features = in_features
-        y = (prob * out).to(x.dtype)
+        if row_sel is not None:
+            # PTQR: forward only this candidate's routed rows (0/1 mask); the
+            # backward below still uses the soft prob, giving the exact
+            # straight-through mixture gradient.
+            y = (out * row_sel.to(out.dtype).unsqueeze(1)).to(x.dtype)
+        else:
+            y = (prob * out).to(x.dtype)
         return y.reshape(*orig_shape[:-1], out_features) if len(orig_shape) != 2 else y
 
     @staticmethod
@@ -1429,7 +1633,8 @@ class _BlockedCandidateLinear(Function):
         grad_x = grad_x.to(x.dtype)
         if len(ctx.x_shape) != 2:
             grad_x = grad_x.reshape(*ctx.x_shape)
-        return (grad_x, None, None, None, None, None, grad_prob)
+        # x, qb, qt, out_features, padded_in_features, in_features, prob, row_sel
+        return (grad_x, None, None, None, None, None, grad_prob, None)
 
 
 class MixedQuantLinear(_MixedQuantBase):
@@ -1490,19 +1695,40 @@ class MixedQuantLinear(_MixedQuantBase):
             if x.device != dev:
                 x = x.to(dev)
             probs = self.get_probs().to(dev)
+            routing = None
+            if _PTQR_STATE.enabled:
+                n = x.numel() // x.shape[-1]
+                routing = _sample_token_routing(probs, n)
             out = None
             for k, qt in enumerate(self.candidate_types):
                 out_k = _BlockedCandidateLinear.apply(
                     x, getattr(self, f"_qweight_{k}"), qt,
                     self.out_features, self.padded_in_features, self.in_features, probs[k],
+                    (routing == k) if routing is not None else None,
                 )
                 out = out_k if out is None else out + out_k
             out = out.to(self.source_dtype)
         else:
             if x.device != self._device:
                 self._compute_device = x.device
-            mixed = self.get_mixed_weight().to(self.source_dtype)
-            out = F.linear(x, mixed)
+            if _PTQR_STATE.enabled:
+                probs = self.get_probs()
+                n = x.numel() // x.shape[-1]
+                routing = _sample_token_routing(probs.to(x.device), n)
+                if self.lazy and not self._dequant_cache_valid:
+                    # One-time: populate the persistent dequant cache via the
+                    # parallel lazy path so PTQR forwards reuse dequants
+                    # instead of re-dequantizing every step.
+                    with torch.no_grad():
+                        self.get_mixed_weight()
+                if self.lazy and self._dequant_cache_valid:
+                    cands = [self._dequant_cache[k] for k in range(self.num_candidates)]
+                else:
+                    cands = [self._get_candidate(k) for k in range(self.num_candidates)]
+                out = _RoutedMixedLinear.apply(self.source_dtype, probs, routing, x, *cands)
+            else:
+                mixed = self.get_mixed_weight().to(self.source_dtype)
+                out = F.linear(x, mixed)
         # Row-parallel shard (input columns split across TP ranks): this rank
         # holds a partial sum, all-reduce completes it (replacing the forward of
         # the RowParallelLinear this module replaced).
@@ -1584,17 +1810,34 @@ class MixedQuantEmbedding(_MixedQuantBase):
             qdev = self._qbytes_device if input.device == self._qbytes_device else input.device
             rows, inverse = torch.unique(input.reshape(-1), return_inverse=True)
             rows = rows.to(qdev)
+            probs = self.get_probs()
+            routing = None
+            if _PTQR_STATE.enabled:
+                routing = _sample_token_routing(probs.to(qdev), rows.shape[0])
             row_mixed = _MixedEmbeddingRowFunctionLazy.apply(
                 self.source_dtype,
                 tuple(self.candidate_types),
                 self.num_embeddings,
                 self.padded_in_features,
                 self.embedding_dim,
-                self.get_probs(),
+                probs,
+                routing,
                 rows,
                 *[getattr(self, f"_qweight_{k}").to(qdev) if getattr(self, f"_qweight_{k}").device != qdev else getattr(self, f"_qweight_{k}") for k in range(self.num_candidates)],
             )
             return row_mixed[inverse].reshape(*input.shape, self.embedding_dim)
+        if _PTQR_STATE.enabled:
+            # PTQR: one candidate's row per position; only the needed rows are
+            # gathered from each CPU candidate (the full mixed vocabulary
+            # weight is never built).
+            flat = input.reshape(-1)
+            probs = self.get_probs()
+            routing = _sample_token_routing(probs.to(input.device), flat.numel())
+            cands = [self._get_candidate(k) for k in range(self.num_candidates)]
+            out = _RoutedEmbeddingRowFunction.apply(
+                self.source_dtype, probs, routing, flat, *cands
+            )
+            return out.reshape(*input.shape, self.embedding_dim)
         mixed = self.get_mixed_weight().to(self.source_dtype)
         return F.embedding(input, mixed)
 

@@ -1517,6 +1517,15 @@ def build_parser():
     parser.add_argument("--st_gumbel_tau", type=float, default=1.0,
                         help="Gumbel sampling temperature for --st_gumbel_fraction (lower = more "
                              "argmax-like sampling). Ignored when fraction is 0.")
+    parser.add_argument("--st_gumbel_anneal", default=None,
+                        help="Anneal hardening fraction across training: 'START:END' (e.g. 0.2:0.8). "
+                             "Overrides the fixed --st_gumbel_fraction schedule; fraction still enables ST.")
+    parser.add_argument("--ptqr", action="store_true",
+                        help="Per-Token Quant Routing: every replaced layer runs each token through "
+                             "ONE candidate (Gumbel-sampled from the gate probs per token) instead of "
+                             "averaging candidates. Removes the within-token mixture (Jensen) gain and "
+                             "the hard/soft chimera; backward stays the exact soft mixture gradient. "
+                             "Incompatible with --st_gumbel_fraction.")
     parser.add_argument("--budget_reduction", type=float, default=0.0,
                         help="Reduce target size budget by this fraction (0.05 = 5% smaller target). "
                              "Gives headroom for tensor upgrades without exceeding target size.")
@@ -1598,10 +1607,21 @@ def run(args):
         raise ValueError("Specify only one of --compression_ratio or --target_bits.")
 
     # Straight-through Gumbel hardening (see MixedQuantLinear.get_probs).
+    if getattr(args, "st_gumbel_fraction", 0.0) > 0.0 and getattr(args, "ptqr", False):
+        raise ValueError("--ptqr and --st_gumbel_fraction are mutually exclusive.")
+    if getattr(args, "ptqr", False):
+        from voodoo_quant import layers as _layers
+
+        _layers.set_ptqr(True)
+        print("  [ptqr] enabled: per-token Gumbel routing from gate probs", flush=True)
     if getattr(args, "st_gumbel_fraction", 0.0) > 0.0:
         from voodoo_quant import layers as _layers
 
         _layers.set_st_gumbel(True, args.st_gumbel_fraction, getattr(args, "st_gumbel_tau", 1.0))
+        if getattr(args, "st_gumbel_anneal", None):
+            _fs, _fe = args.st_gumbel_anneal.split(":")
+            _layers.set_st_gumbel_anneal(float(_fs), float(_fe), args.max_steps)
+            print(f"  [st-gumbel] anneal: {args.st_gumbel_anneal} over {args.max_steps} steps", flush=True)
         print(
             f"  [st-gumbel] enabled: fraction={args.st_gumbel_fraction} "
             f"tau={getattr(args, 'st_gumbel_tau', 1.0)}",
@@ -2594,6 +2614,11 @@ def run(args):
             scheduler.step()
             optimizer.zero_grad()
             completed_opt_steps += 1
+            # Notify the ST-Gumbel fraction-anneal schedule of training progress.
+            if getattr(args, "st_gumbel_anneal", None):
+                from voodoo_quant import layers as _layers
+
+                _layers.st_gumbel_step(completed_opt_steps)
             if args.partial_save_interval > 0 and (completed_opt_steps % args.partial_save_interval == 0):
                 if tp_enabled:
                     # ALL ranks enter the gather (it is a collective); rank 0

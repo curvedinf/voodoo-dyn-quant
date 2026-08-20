@@ -53,6 +53,17 @@ stay exact). Sampling rather than argmax keeps exploration alive: an early
 wrong choice still receives gradient and can be corrected on later steps.
 `--st_gumbel_tau` controls the sample sharpness (lower = more argmax-like).
 
+The recommended routing mode is **PTQR** (per-token quant routing, `--ptqr`):
+every token runs through exactly ONE candidate, Gumbel-sampled per token from
+the gate probs (token shares match the probs in expectation; routing
+concentrates on the argmax candidate as `τ` anneals, so the forward converges
+to the deployed model). Backward keeps the exact soft-mixture gradient
+(straight-through). PTQR removes the within-token mixture (Jensen) gain of the
+soft forward and the hard/soft chimera of ST-Gumbel; in the 0.8B campaign it
+was the first config to beat the soft-mixture baseline at a matched budget.
+Budget accounting (`effective_bytes`) and the final bake are unaffected.
+`--ptqr` is mutually exclusive with `--st_gumbel_fraction`.
+
 ### 2.2 The loss
 
 The only trainable parameters are the gates (~one scalar per tensor per

@@ -5,6 +5,8 @@
 # attribution (see WHITEPAPER.md §6): per-role candidate menus with fine rungs
 # both directions, a reversed post-hoc guardrail (MLP one rung UP, attention
 # one rung DOWN), no force_quant pins, own imatrix, seq_len 8192.
+# V30 final: 50 gate-learning steps (per SDGraft, 2026-08-20 — 100 steps gave
+# no benefit at this scale either).
 #
 # Prerequisites (one-time):
 #   1. make bootstrap                     # venv + libggml
@@ -49,7 +51,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # CUDA (harmless on ROC
 RESUME_ARGS=""
 if [ -s "$OUT/partial.pt" ] && [ -s "$OUT/partial.meta.json" ]; then
     PREV=$($PY -c "import json;print(json.load(open('$OUT/partial.meta.json'))['completed_optimizer_steps'])" 2>/dev/null || echo 0)
-    if [ "$PREV" -gt 0 ] && [ "$PREV" -lt 100 ]; then
+    if [ "$PREV" -gt 0 ] && [ "$PREV" -lt 50 ]; then
         RESUME_ARGS="--resume_from_partial $OUT/partial.pt"
         echo "launcher: resuming from journal at optimizer step $PREV" >> "$OUT/train_tp.log"
     fi
@@ -79,7 +81,7 @@ exec "$PY" -m torch.distributed.run \
     --seq_len 8192 \
     --batch_size 1 \
     --grad_accum_steps 1 \
-    --max_steps 100 \
+    --max_steps 50 \
     --lr 0.5 \
     --size_weight 100.0 \
     --size_tolerance 0.02 \

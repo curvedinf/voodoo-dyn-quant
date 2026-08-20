@@ -19,7 +19,9 @@ checkpoint (`<slug>-Voodoo{NN}.pt`), a `quant_assignments.json` sidecar, and a
 .venv/bin/voodoo train \
     --model Qwen/Qwen3.5-0.8B-Base \
     --compression_ratio 0.45 \
-    --max_steps 100 --lr 0.5 --size_weight 100.0 --size_tolerance 0.02 \
+    --ptqr \
+    --max_steps 50 --lr 0.25 --distill_weight 2.0 --grad_accum_steps 1 \
+    --size_weight 100.0 --size_tolerance 0.02 \
     --seq_len 512 --batch_size 1 \
     --data_dir data/qwen35-0.8b --data_name train_tokens.pt \
     --output_dir checkpoints/Qwen3.5-0.8B/Voodoo45 \
@@ -27,9 +29,22 @@ checkpoint (`<slug>-Voodoo{NN}.pt`), a `quant_assignments.json` sidecar, and a
     --device cuda --dtype bfloat16 --no_compile
 ```
 
-Defaults that just work for 0.5B–8B: non-lazy candidates, batch 1, 100 steps.
-First run quantizes the candidate cache (slow init is normal — watch the
-progress line); later sizes start in seconds.
+Defaults that just work for 0.5B–8B (from the 0.8B PTQR iteration campaign):
+`--ptqr` routing, non-lazy candidates, batch 1, 50 steps, lr 0.25,
+distill_weight 2.0, grad_accum 1. First run quantizes the candidate cache
+(slow init is normal — watch the progress line); later sizes start in seconds.
+
+Notes behind those defaults:
+
+- **PTQR > soft mixture > ST-Gumbel.** Per-token routing was the first config
+  to beat the soft-mixture baseline at a matched budget and its forward
+  converges to the deployed model as tau anneals. ST-Gumbel hard-fraction
+  mode is rejected (the hard/soft chimera never converged across 4 configs).
+- **lr is the dominant lever**: 0.25 (stable) and 1.0 (fast) both land well;
+  0.5 is a measured local worst. **50 steps is enough** — 100 gave no benefit.
+- **grad_accum 1**: accum=4 lowered closing train KL yet worsened eval PPL.
+- Judge iterations by torch KLD vs the BF16 teacher, not PPL and not closing
+  train KL (see the eval skill).
 
 ## 2. Large model, tensor parallel
 
@@ -51,7 +66,7 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
     --compression_ratio 0.30 --budget_reduction 0.03 \
     --tensor_upgrades '[{"pattern":"mlp\\.(gate|up|down)_proj$","levels":1},{"pattern":"linear_attn|self_attn","levels":-1}]' \
     --seq_len 8192 --batch_size 1 --grad_accum_steps 1 \
-    --max_steps 100 --lr 0.5 --size_weight 100.0 --size_tolerance 0.02 \
+    --max_steps 50 --lr 0.5 --size_weight 100.0 --size_tolerance 0.02 \
     --lazy --imatrix <imatrix.gguf> \
     --candidate_types Q8_0 Q5_K IQ3_S IQ2_S IQ2_XXS IQ1_S \
     --attention_candidates Q5_K IQ3_S IQ2_S IQ2_XXS \
@@ -81,10 +96,20 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
 - **Knapsack polish** (`--polish`): after argmax, budget-aware one-rung swaps
   ranked by the measured table. Requires `--warm_start`'s table (persists to
   `sensitivity.pkl`); skips itself otherwise.
+- **PTQR routing** (`--ptqr`): each token runs through ONE candidate,
+  Gumbel-sampled per token from the gate probs (shares match probs in
+  expectation; converges to the argmax assignment as tau anneals). Backward
+  keeps the exact soft mixture gradient (straight-through). This is the
+  recommended routing mode for new runs — it beat the soft-mixture baseline
+  at matched budget and trains the model you actually deploy.
 - **ST-Gumbel hardening** (`--st_gumbel_fraction`, e.g. 0.5): each layer
   forwards a one-hot Gumbel sample of its gates with that per-step probability
-  (deployed-model behavior) while gradients stay soft/exact. Off by default;
-  `--st_gumbel_tau` tunes sample sharpness.
+  while gradients stay soft/exact; `--st_gumbel_tau` tunes sample sharpness,
+  `--st_gumbel_anneal START:END` ramps the fraction across training.
+  Mutually exclusive with `--ptqr`, and REJECTED as a routing mode by the
+  0.8B campaign (never converged) — kept for ablation only. Runs predating
+  the Gumbel clamp-precedence fix (2026-08-20) silently forwarded candidate 0
+  and are invalid.
 - **Long context**: train at the seq_len you serve (8192); the quality gap of
   a bad allocation widens with context (5.3% → 9.2% from 512 → 8k).
 - **Keep your own imatrix** (`--imatrix`); calibration volume is worth only

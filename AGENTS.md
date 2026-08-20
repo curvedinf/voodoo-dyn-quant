@@ -81,10 +81,25 @@ tests/               unit + smoke tests (CPU-runnable where possible)
 - Default candidate set excludes ternary (`TQ1_0`/`TQ2_0` underperform).
 - Post-hoc `--tensor_upgrades` accept negative levels (rungs down); first
   match wins; `--budget_reduction` funds upgrades without busting the target.
+- PTQR per-token quant routing (`--ptqr`): every replaced layer forwards each
+  token through ONE candidate, Gumbel-sampled per token from the gate probs
+  (`_sample_token_routing` in `layers.py`); backward keeps the exact soft
+  mixture gradient (straight-through). Budget (`effective_bytes`, soft probs)
+  and the bake are unchanged. The recommended routing mode (beat soft mixture
+  at matched budget); mutually exclusive with `--st_gumbel_fraction`.
+  Gate tests: `tests/test_ptqr.py`.
 - Straight-through Gumbel hardening (`--st_gumbel_fraction`, 0 = off): each
   layer forwards a one-hot Gumbel sample of its gates with that per-step
   probability; backward stays soft/exact. `--st_gumbel_tau` sets sampling
-  sharpness.
+  sharpness; `--st_gumbel_anneal START:END` ramps the fraction over training.
+  Rejected as a routing mode by the 0.8B PTQR campaign (chimera never
+  converged) — ablation only. Runs predating the 2026-08-20 clamp-precedence
+  fix silently forwarded candidate 0 and are invalid.
+- 0.8B recipe defaults (PTQR campaign): `--ptqr --lr 0.25 --distill_weight
+  2.0 --grad_accum_steps 1 --max_steps 50 --size_weight 100.0
+  --size_tolerance 0.02`; lr 0.5 is a measured local worst, 100 steps give no
+  benefit over 50. Judge iterations by torch KLD vs the BF16 teacher, not
+  train-log closing KL.
 - Training runs journal `partial.pt` + `partial.meta.json` in the output dir;
   crash recovery is `--finalize_from_partial`, continue-training is
   `--resume_from_partial`. TP launchers auto-resume from the journal.
